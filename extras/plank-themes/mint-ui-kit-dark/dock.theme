@@ -1,0 +1,20 @@
+# mint-ui-kit Plank theme (dark): solid background to match Orchis.
+# Solid colours also look right over remote desktop, where compositing
+# (transparency) is often off.
+[PlankTheme]
+TopRoundness=8
+BottomRoundness=0
+LineWidth=1
+OuterStrokeColor=28;;28;;28;;255
+FillStartColor=44;;44;;44;;255
+FillEndColor=44;;44;;44;;255
+InnerStrokeColor=44;;44;;44;;255
+
+[PlankDockTheme]
+HorizPadding=2
+TopPadding=1
+BottomPadding=1
+ItemPadding=4
+IndicatorSize=4
+IconShadowSize=0
+CascadeHide=false

@@ -1,0 +1,207 @@
+#!/bin/bash
+# panel-layout - write the "topbar-dock" XFCE panel layout for this user
+#
+#   Top bar : Whisker menu | ............ | tray  sound  notifications  power  clock
+#   Dock    : DOCK_STYLE=plank - Plank (pinned apps + open windows; right-click
+#                                an open app -> "Keep in Dock" to pin it)
+#             DOCK_STYLE=panel - XFCE panel: pinned launchers | open windows
+#
+# Called by install-ui.sh with no desktop session running (the panel would
+# overwrite the files otherwise).
+# Reads TOPBAR_SIZE, TOPBAR_ICON_SIZE, DOCK_STYLE, DOCK_SIZE, DOCK_AUTOHIDE,
+# DOCK_APPS, CLOCK_FORMAT from the environment (install-ui.sh passes kit.conf).
+# Plank's size/hiding/theme are applied at login by desktop-style, because
+# they live in dconf, which needs a running desktop session.
+
+set -euo pipefail
+
+TOPBAR_SIZE="${TOPBAR_SIZE:-28}"
+TOPBAR_ICON_SIZE="${TOPBAR_ICON_SIZE:-16}"
+DOCK_STYLE="${DOCK_STYLE:-plank}"
+DOCK_SIZE="${DOCK_SIZE:-48}"
+DOCK_APPS="${DOCK_APPS:-firefox thunar xfce4-terminal}"
+CLOCK_FORMAT="${CLOCK_FORMAT:-%a %b %-d  %-I:%M %p}"
+case "${DOCK_AUTOHIDE:-intelligent}" in
+  never)  AUTOHIDE=0 ;;
+  always) AUTOHIDE=2 ;;
+  *)      AUTOHIDE=1 ;;
+esac
+
+CFG="$HOME/.config/xfce4"
+XML="$CFG/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
+PANEL_DIR="$CFG/panel"
+
+xml_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' <<<"$1"; }
+
+desktop_file() {
+  local d
+  for d in "$HOME/.local/share/applications" /usr/local/share/applications \
+           /usr/share/applications /var/lib/flatpak/exports/share/applications; do
+    if [ -f "$d/$1.desktop" ]; then echo "$d/$1.desktop"; return 0; fi
+  done
+  return 1
+}
+
+# Keep Mint's Whisker menu settings (icon, favourites) if we can find them
+whisker_src=""
+for f in "$PANEL_DIR"/whiskermenu-*.rc /etc/xdg/xdg-xfce/xfce4/panel/whiskermenu-*.rc; do
+  if [ -f "$f" ]; then whisker_src="$f"; break; fi
+done
+tmp_whisker="$(mktemp)"
+trap 'rm -f "$tmp_whisker"' EXIT
+if [ -n "$whisker_src" ]; then cp "$whisker_src" "$tmp_whisker"; fi
+
+rm -rf "$PANEL_DIR"
+mkdir -p "$PANEL_DIR" "$(dirname "$XML")"
+
+# Whisker menu: Log Out without the dialog (it freezes RDP sessions)
+if grep -q '^command-logout=' "$tmp_whisker"; then
+  sed -i 's|^command-logout=.*|command-logout=xfce4-session-logout --logout|' "$tmp_whisker"
+else
+  echo 'command-logout=xfce4-session-logout --logout' >> "$tmp_whisker"
+fi
+cp "$tmp_whisker" "$PANEL_DIR/whiskermenu-1.rc"
+
+next_id=1
+top_ids=() dock_ids=() plugins=""
+
+add_plugin() {
+  # add_plugin <top|dock> <type> [inner xml]
+  local id=$next_id
+  next_id=$((next_id + 1))
+  if [ "$1" = top ]; then top_ids+=("$id"); else dock_ids+=("$id"); fi
+  if [ -n "${3:-}" ]; then
+    plugins+="    <property name=\"plugin-$id\" type=\"string\" value=\"$2\">
+$3
+    </property>
+"
+  else
+    plugins+="    <property name=\"plugin-$id\" type=\"string\" value=\"$2\"/>
+"
+  fi
+  LAST_ID=$id
+}
+
+# --- Top bar ---
+add_plugin top whiskermenu
+add_plugin top separator '      <property name="expand" type="bool" value="true"/>
+      <property name="style" type="uint" value="0"/>'
+# Tray: every icon at the same size in an equal square slot, symbolic
+# (monochrome) where the app supports it, so it matches the plugin icons
+add_plugin top systray "      <property name=\"square-icons\" type=\"bool\" value=\"true\"/>
+      <property name=\"icon-size\" type=\"int\" value=\"$TOPBAR_ICON_SIZE\"/>
+      <property name=\"symbolic-icons\" type=\"bool\" value=\"true\"/>
+      <property name=\"single-row\" type=\"bool\" value=\"true\"/>"
+add_plugin top pulseaudio '      <property name="enable-keyboard-shortcuts" type="bool" value="true"/>'
+add_plugin top notification-plugin
+# Battery/power icon only on machines that have a battery
+if grep -qsx Battery /sys/class/power_supply/*/type; then
+  add_plugin top power-manager-plugin
+fi
+add_plugin top clock "      <property name=\"mode\" type=\"uint\" value=\"2\"/>
+      <property name=\"digital-layout\" type=\"uint\" value=\"3\"/>
+      <property name=\"digital-time-format\" type=\"string\" value=\"$(xml_escape "$CLOCK_FORMAT")\"/>
+      <property name=\"tooltip-format\" type=\"string\" value=\"%A, %B %-d, %Y\"/>"
+
+PLANK_DIR="$HOME/.config/plank/dock1"
+PLANK_AUTOSTART="$HOME/.config/autostart/plank.desktop"
+
+if [ "$DOCK_STYLE" = plank ]; then
+  # --- Dock: Plank. Pinned apps are .dockitem files; desktop-style puts them
+  # in DOCK_APPS order at the next login (from .kit-order). Apps you pin later
+  # with "Keep in Dock" are kept until the layout is rebuilt.
+  rm -rf "$PLANK_DIR/launchers"
+  mkdir -p "$PLANK_DIR/launchers" "$(dirname "$PLANK_AUTOSTART")"
+  : > "$PLANK_DIR/.kit-order"
+  for app in $DOCK_APPS; do
+    if df="$(desktop_file "$app")"; then
+      printf '[PlankDockItemPreferences]\nLauncher=file://%s\n' "$df" \
+        > "$PLANK_DIR/launchers/$app.dockitem"
+      echo "$app.dockitem" >> "$PLANK_DIR/.kit-order"
+      echo "    dock: $app"
+    else
+      echo "    dock: $app (not installed, skipped)"
+    fi
+  done
+  cat > "$PLANK_AUTOSTART" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Plank
+Comment=Dock (mint-ui-kit)
+Exec=plank
+X-GNOME-Autostart-enabled=true
+EOF
+else
+  # --- Dock: XFCE panel, one launcher per pinned app + open windows ---
+  rm -f "$PLANK_AUTOSTART"
+  for app in $DOCK_APPS; do
+    if df="$(desktop_file "$app")"; then
+      add_plugin dock launcher "      <property name=\"items\" type=\"array\">
+        <value type=\"string\" value=\"$app.desktop\"/>
+      </property>"
+      mkdir -p "$PANEL_DIR/launcher-$LAST_ID"
+      cp "$df" "$PANEL_DIR/launcher-$LAST_ID/$app.desktop"
+      echo "    dock: $app"
+    else
+      echo "    dock: $app (not installed, skipped)"
+    fi
+  done
+  add_plugin dock separator '      <property name="expand" type="bool" value="false"/>
+      <property name="style" type="uint" value="1"/>'
+  add_plugin dock tasklist '      <property name="show-labels" type="bool" value="false"/>
+      <property name="grouping" type="uint" value="1"/>
+      <property name="flat-buttons" type="bool" value="true"/>
+      <property name="show-handle" type="bool" value="false"/>
+      <property name="include-all-workspaces" type="bool" value="false"/>'
+fi
+
+ids_xml() {
+  local i
+  for i in "$@"; do echo "        <value type=\"int\" value=\"$i\"/>"; done
+}
+
+# XFCE dock panel (panel-2), only when DOCK_STYLE=panel
+panel2_id="" panel2_xml=""
+if [ "$DOCK_STYLE" != plank ]; then
+  panel2_id='    <value type="int" value="2"/>'
+  panel2_xml="    <property name=\"panel-2\" type=\"empty\">
+      <property name=\"position\" type=\"string\" value=\"p=10;x=0;y=0\"/>
+      <property name=\"output-name\" type=\"string\" value=\"Primary\"/>
+      <property name=\"length\" type=\"uint\" value=\"1\"/>
+      <property name=\"length-adjust\" type=\"bool\" value=\"true\"/>
+      <property name=\"position-locked\" type=\"bool\" value=\"true\"/>
+      <property name=\"size\" type=\"uint\" value=\"$DOCK_SIZE\"/>
+      <property name=\"icon-size\" type=\"uint\" value=\"0\"/>
+      <property name=\"autohide-behavior\" type=\"uint\" value=\"$AUTOHIDE\"/>
+      <property name=\"plugin-ids\" type=\"array\">
+$(ids_xml "${dock_ids[@]}")
+      </property>
+    </property>"
+fi
+
+cat > "$XML" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- mint-ui-kit "topbar-dock" layout (generated by panel-layout) -->
+<channel name="xfce4-panel" version="1.0">
+  <property name="configver" type="int" value="2"/>
+  <property name="panels" type="array">
+    <value type="int" value="1"/>
+$panel2_id
+    <property name="panel-1" type="empty">
+      <property name="position" type="string" value="p=6;x=0;y=0"/>
+      <property name="output-name" type="string" value="Primary"/>
+      <property name="length" type="uint" value="100"/>
+      <property name="position-locked" type="bool" value="true"/>
+      <property name="size" type="uint" value="$TOPBAR_SIZE"/>
+      <property name="icon-size" type="uint" value="$TOPBAR_ICON_SIZE"/>
+      <property name="plugin-ids" type="array">
+$(ids_xml "${top_ids[@]}")
+      </property>
+    </property>
+$panel2_xml
+  </property>
+  <property name="plugins" type="empty">
+$plugins  </property>
+</channel>
+EOF
+echo "    panel layout written"

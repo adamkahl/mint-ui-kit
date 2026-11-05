@@ -1,0 +1,150 @@
+#!/bin/sh
+# desktop-style - apply the kit's theme at login, and switch
+# light/dark at sunrise/sunset when THEME_MODE=auto.
+#
+# Settings: ~/.config/desktop-style.conf (installed by install-ui.sh)
+# Started at login by ~/.config/autostart/desktop-style.desktop
+# Uses only xfconf/gsettings, the standard XFCE/GTK settings interfaces.
+#
+#   desktop-style          run normally
+#   desktop-style --once   apply once and exit (handy for testing)
+
+CONF="$HOME/.config/desktop-style.conf"
+LIGHT_GTK=Mint-Y-Aqua;  DARK_GTK=Mint-Y-Dark-Aqua
+LIGHT_WM=Mint-Y;        DARK_WM=Mint-Y-Dark
+LIGHT_ICONS=Papirus;    DARK_ICONS=Papirus-Dark
+THEME_MODE=auto
+LATITUDE=42.53N
+LONGITUDE=83.78W
+CHECK_EVERY=300
+DOCK_STYLE=plank
+DOCK_SIZE=48
+DOCK_AUTOHIDE=intelligent
+DOCK_AUTOHIDE_REMOTE=never
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+
+# Over remote desktop (xrdp sets XRDP_SESSION) the screen edge is hard to
+# reach, so a hidden dock can't be brought back: use DOCK_AUTOHIDE_REMOTE
+if [ -n "${XRDP_SESSION:-}" ] && [ -n "$DOCK_AUTOHIDE_REMOTE" ]; then
+  DOCK_AUTOHIDE=$DOCK_AUTOHIDE_REMOTE
+fi
+
+PLANK_SCHEMA=net.launchpad.plank.dock.settings
+PLANK_PATH=/net/launchpad/plank/docks/dock1/
+PLANK_ORDER="$HOME/.config/plank/dock1/.kit-order"
+
+plank_set() {
+  # plank_set <key> <value>: only touch it when it changes
+  cur=$(gsettings get "$PLANK_SCHEMA:$PLANK_PATH" "$1" 2>/dev/null) || return 0
+  [ "$cur" = "$2" ] || gsettings set "$PLANK_SCHEMA:$PLANK_PATH" "$1" "$2" 2>/dev/null
+}
+
+setup_panel_dock() {
+  # XFCE panel dock (DOCK_STYLE=panel, panel-2): hiding for this session
+  [ "$DOCK_STYLE" = panel ] || return 0
+  xfconf-query -c xfce4-panel -p /panels/panel-2/position >/dev/null 2>&1 || return 0
+  case "$DOCK_AUTOHIDE" in
+    never)  ah=0 ;;
+    always) ah=2 ;;
+    *)      ah=1 ;;
+  esac
+  set_if xfce4-panel /panels/panel-2/autohide-behavior "$ah"
+}
+
+setup_plank() {
+  # Size, hiding and position from kit.conf; Plank picks changes up live
+  [ "$DOCK_STYLE" = plank ] || return 0
+  gsettings list-keys "$PLANK_SCHEMA" >/dev/null 2>&1 || return 0
+  case "$DOCK_AUTOHIDE" in
+    never)  hide=none ;;
+    always) hide=auto ;;
+    *)      hide=intelligent ;;
+  esac
+  plank_set hide-mode "'$hide'"
+  plank_set icon-size "$((DOCK_SIZE - 4))"
+  plank_set position "'bottom'"
+  plank_set alignment "'center'"
+  plank_set zoom-enabled false
+  plank_set show-dock-item false
+  plank_set pinned-only false
+  # First login after a layout rebuild: put the pinned apps in kit.conf order
+  if [ -s "$PLANK_ORDER" ]; then
+    items=$(sed "s/.*/'&'/" "$PLANK_ORDER" | paste -sd, -)
+    gsettings set "$PLANK_SCHEMA:$PLANK_PATH" dock-items "[$items]" 2>/dev/null &&
+      rm -f "$PLANK_ORDER"
+  fi
+}
+
+THEME_DIRS="$HOME/.themes $HOME/.local/share/themes /usr/share/themes"
+ICON_DIRS="$HOME/.icons $HOME/.local/share/icons /usr/share/icons"
+
+has_dir() {
+  # has_dir <name> <subdir> <dirs...>: true if <dir>/<name>/<subdir> exists
+  name="$1"; sub="$2"; shift 2
+  for d in "$@"; do
+    [ -d "$d/$name/$sub" ] && return 0
+  done
+  return 1
+}
+
+set_if() {
+  # set_if <channel> <property> <value>: only touch it when it changes
+  [ -n "$3" ] || return 0
+  cur=$(xfconf-query -c "$1" -p "$2" 2>/dev/null)
+  [ "$cur" = "$3" ] || xfconf-query -c "$1" -p "$2" -s "$3" 2>/dev/null
+}
+
+apply_theme() {
+  # apply_theme light|dark
+  if [ "$1" = dark ]; then gtk=$DARK_GTK; wm=$DARK_WM; icons=$DARK_ICONS; scheme=prefer-dark
+  else gtk=$LIGHT_GTK; wm=$LIGHT_WM; icons=$LIGHT_ICONS; scheme=prefer-light; fi
+
+  # shellcheck disable=SC2086
+  has_dir "$gtk" gtk-3.0 $THEME_DIRS && set_if xsettings /Net/ThemeName "$gtk"
+  # shellcheck disable=SC2086
+  has_dir "$wm" xfwm4 $THEME_DIRS && set_if xfwm4 /general/theme "$wm"
+  # shellcheck disable=SC2086
+  has_dir "$icons" "" $ICON_DIRS && set_if xsettings /Net/IconThemeName "$icons"
+  gsettings set org.gnome.desktop.interface color-scheme "$scheme" 2>/dev/null
+  # Solid light/dark dock to match (themes installed by install-ui.sh)
+  [ "$DOCK_STYLE" = plank ] && plank_set theme "'mint-ui-kit-$1'"
+}
+
+is_night() {
+  # true when the sun is below the horizon at LATITUDE/LONGITUDE
+  # (python3-astral; coordinates like 42.53N 83.78W or signed decimals)
+  python3 - "$LATITUDE" "$LONGITUDE" 2>/dev/null <<'EOF'
+import sys
+from astral import Observer
+from astral.sun import elevation
+def coord(v):
+    v = v.strip().upper()
+    sign = -1 if v[-1:] in ("S", "W") else 1
+    return sign * float(v.rstrip("NSEW"))
+obs = Observer(latitude=coord(sys.argv[1]), longitude=coord(sys.argv[2]))
+sys.exit(0 if elevation(obs) < -0.833 else 1)
+EOF
+}
+
+current_mode() {
+  case "$THEME_MODE" in
+    dark)  echo dark ;;
+    light) echo light ;;
+    *)     if is_night; then echo dark; else echo light; fi ;;
+  esac
+}
+
+setup_plank
+setup_panel_dock
+last=""
+while true; do
+  mode=$(current_mode)
+  if [ "$mode" != "$last" ]; then
+    apply_theme "$mode"
+    last=$mode
+  fi
+  [ "${1:-}" = "--once" ] && exit 0
+  [ "$THEME_MODE" = auto ] || exit 0
+  sleep "$CHECK_EVERY"
+done

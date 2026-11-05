@@ -1,0 +1,109 @@
+#!/bin/sh
+# dock-monitors - a Plank dock on every monitor, following monitor changes
+#
+# The main dock ("dock1", started by ~/.config/autostart/plank.desktop) stays
+# on the primary monitor. This adds one extra dock ("kit-<monitor>") on each
+# other monitor, and closes it again when that monitor goes away.
+#
+# All docks share dock1's pinned apps (their launchers folder is a link to
+# dock1's), so "Keep in Dock" on any screen pins the app everywhere, and they
+# copy dock1's look (theme, size, hiding), which desktop-style keeps current.
+#
+# Started at login by ~/.config/autostart/dock-monitors.desktop when
+# DOCK_STYLE=plank and DOCK_MONITORS=all (installed by install-ui.sh).
+#
+#   dock-monitors          run normally
+#   dock-monitors --once   sync once and exit (handy for testing)
+
+CHECK_EVERY=3
+SCHEMA=net.launchpad.plank.dock.settings
+BASE=/net/launchpad/plank/docks
+CFG="$HOME/.config/plank"
+# Settings copied from dock1 to every extra dock
+SYNC_KEYS="theme icon-size hide-mode position alignment zoom-enabled show-dock-item pinned-only dock-items"
+
+# Only one watcher per session
+lock="${XDG_RUNTIME_DIR:-/tmp}/dock-monitors.$(id -u).lock"
+exec 9>"$lock"
+flock -n 9 || exit 0
+
+monitors() {
+  # Connector names of the non-primary monitors, skipping any that lie
+  # entirely inside another monitor (mirrored/cloned screens)
+  xrandr --listactivemonitors 2>/dev/null | awk '
+    NR > 1 {
+      n++; name[n] = $NF; prim[n] = ($2 ~ /\*/)
+      split($3, g, /[\/x+]/)              # 2560/597x1440/336+0+0
+      w[n] = g[1]; h[n] = g[3]; x[n] = g[5]; y[n] = g[6]
+    }
+    END {
+      p = 0; for (i = 1; i <= n; i++) if (prim[i]) p = i
+      if (!p) p = 1                         # no primary set: first one
+      for (i = 1; i <= n; i++) {
+        if (i == p) continue
+        inside = 0
+        for (j = 1; j <= n; j++) {
+          if (j == i) continue
+          if (x[i] >= x[j] && y[i] >= y[j] &&
+              x[i] + w[i] <= x[j] + w[j] && y[i] + h[i] <= y[j] + h[j] &&
+              (w[i] < w[j] || h[i] < h[j] || j < i)) inside = 1
+        }
+        if (!inside) print name[i]
+      }
+    }'
+}
+
+dock_name() { echo "kit-$1" | tr -c 'A-Za-z0-9_\n-' '-'; }
+
+running_docks() {
+  # names of the extra docks we started (plank -n kit-...)
+  pgrep -u "$(id -u)" -a -x plank 2>/dev/null |
+    sed -n 's/.* -n \(kit-[^ ]*\).*/\1/p'
+}
+
+sync_settings() {
+  # sync_settings <dock>: copy dock1's look to <dock> where it differs
+  for k in $SYNC_KEYS; do
+    want=$(gsettings get "$SCHEMA:$BASE/dock1/" "$k" 2>/dev/null) || continue
+    have=$(gsettings get "$SCHEMA:$BASE/$1/" "$k" 2>/dev/null)
+    [ "$want" = "$have" ] || gsettings set "$SCHEMA:$BASE/$1/" "$k" "$want" 2>/dev/null
+  done
+}
+
+start_dock() {
+  # start_dock <monitor>
+  d=$(dock_name "$1")
+  mkdir -p "$CFG/$d" "$CFG/dock1/launchers"
+  # share dock1's pinned apps
+  if [ ! -L "$CFG/$d/launchers" ]; then
+    rm -rf "$CFG/$d/launchers"
+    ln -s ../dock1/launchers "$CFG/$d/launchers"
+  fi
+  sync_settings "$d"
+  gsettings set "$SCHEMA:$BASE/$d/" monitor "'$1'" 2>/dev/null
+  setsid plank -n "$d" >/dev/null 2>&1 9>&- &   # 9>&-: the dock must not hold our lock
+}
+
+stop_dock() {
+  pkill -u "$(id -u)" -x -f "plank -n $1" 2>/dev/null
+}
+
+while true; do
+  want=$(monitors)
+  have=$(running_docks)
+  for m in $want; do
+    d=$(dock_name "$m")
+    if echo "$have" | grep -qx "$d"; then
+      sync_settings "$d"
+    else
+      start_dock "$m"
+    fi
+  done
+  for d in $have; do
+    keep=0
+    for m in $want; do [ "$(dock_name "$m")" = "$d" ] && keep=1; done
+    [ $keep -eq 1 ] || stop_dock "$d"
+  done
+  [ "${1:-}" = "--once" ] && exit 0
+  sleep "$CHECK_EVERY" 9>&-
+done

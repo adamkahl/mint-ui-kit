@@ -14,6 +14,12 @@ Guacamole.
   pinned apps and open windows, on a solid light/dark background. Right-click
   an open app → **Keep in Dock** to pin it; drag an icon off the dock to unpin
   it. (`DOCK_STYLE=panel` in `kit.conf` uses an XFCE panel dock instead.)
+- **Every monitor:** with `DOCK_MONITORS=all` each monitor gets its own dock,
+  added and removed automatically as you connect or disconnect screens. Pins
+  are shared, so pinning on one screen pins everywhere. Every dock shows all
+  open apps (Plank can't split them by screen).
+- **Remote desktop:** the dock never auto-hides over xrdp
+  (`DOCK_AUTOHIDE_REMOTE`), since the screen edge is hard to reach there.
 
 | File | What it does |
 |---|---|
@@ -24,6 +30,7 @@ Guacamole.
 | `extras/desktop-style` | Applies the themes and dock settings at login and switches light/dark |
 | `extras/panel-layout` | Builds the top bar + dock |
 | `extras/plank-themes/` | The solid light/dark dock themes |
+| `extras/dock-monitors` | Keeps a dock on every monitor as monitors come and go |
 
 ## Set up a machine
 

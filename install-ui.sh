@@ -145,11 +145,34 @@ Exec=$HOME/.local/bin/desktop-style
 X-GNOME-Autostart-enabled=true
 EOF
 
+# A Plank dock on every monitor (DOCK_MONITORS=all), following monitor changes
+DM_AUTOSTART="$HOME/.config/autostart/dock-monitors.desktop"
+pkill -u "$USER" -f "$HOME/.local/bin/dock-monitors" 2>/dev/null || true
+if [ "${DOCK_STYLE:-plank}" = plank ] && [ "${DOCK_MONITORS:-all}" = all ]; then
+  echo "==> Installing dock-monitors (a dock on every monitor)"
+  install -m 755 "$KIT_DIR/extras/dock-monitors" "$HOME/.local/bin/dock-monitors"
+  cat > "$DM_AUTOSTART" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Dock on every monitor
+Comment=One Plank dock per monitor (mint-ui-kit)
+Exec=$HOME/.local/bin/dock-monitors
+X-GNOME-Autostart-enabled=true
+EOF
+else
+  rm -f "$DM_AUTOSTART"
+  # close extra docks from DOCK_MONITORS=all
+  pkill -u "$USER" -f '^plank -n kit-' 2>/dev/null || true
+fi
+
 if [ $IN_SESSION -eq 1 ]; then
   echo "==> Applying now"
   pkill -u "$USER" -f "$HOME/.local/bin/desktop-style" 2>/dev/null || true
   "$HOME/.local/bin/desktop-style" --once
   nohup "$HOME/.local/bin/desktop-style" >/dev/null 2>&1 &
+  if [ -f "$DM_AUTOSTART" ] && pgrep -u "$USER" -x plank >/dev/null; then
+    nohup "$HOME/.local/bin/dock-monitors" >/dev/null 2>&1 &
+  fi
 fi
 
 echo

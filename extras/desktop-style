@@ -55,6 +55,9 @@ setup_panel_dock() {
 setup_plank() {
   # Size, hiding and position from kit.conf; Plank picks changes up live
   [ "$DOCK_STYLE" = plank ] || return 0
+  # XFCE draws a shadow under dock windows; Plank's window spans the whole
+  # screen width, so the shadow shows as a full-width line when it hides
+  set_if xfwm4 /general/show_dock_shadow false
   gsettings list-keys "$PLANK_SCHEMA" >/dev/null 2>&1 || return 0
   case "$DOCK_AUTOHIDE" in
     never)  hide=none ;;

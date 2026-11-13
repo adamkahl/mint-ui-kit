@@ -77,6 +77,7 @@ echo "==> Installing packages"
 pkgs="$PACKAGES"
 [ "${THEME_MODE:-auto}" = auto ] && pkgs="$pkgs python3-astral"
 [ "${DOCK_STYLE:-plank}" = plank ] && pkgs="$pkgs plank"
+pkgs="$pkgs python3-gi gir1.2-wnck-3.0"      # for monitor-watch
 # shellcheck disable=SC2086
 sudo apt-get install -y $pkgs
 
@@ -132,7 +133,7 @@ cp -r "$KIT_DIR/extras/plank-themes/." "$HOME/.local/share/plank/themes/"
   echo "# Written by mint-ui-kit install-ui.sh from kit.conf"
   for v in LIGHT_GTK DARK_GTK LIGHT_WM DARK_WM LIGHT_ICONS DARK_ICONS \
            THEME_MODE LATITUDE LONGITUDE DOCK_STYLE DOCK_SIZE DOCK_AUTOHIDE \
-           DOCK_AUTOHIDE_REMOTE; do
+           DOCK_AUTOHIDE_REMOTE DOCK_MONITORS; do
     printf '%s="%s"\n' "$v" "${!v:-}"
   done
 } > "$HOME/.config/desktop-style.conf"
@@ -145,23 +146,24 @@ Exec=$HOME/.local/bin/desktop-style
 X-GNOME-Autostart-enabled=true
 EOF
 
-# A Plank dock on every monitor (DOCK_MONITORS=all), following monitor changes
-DM_AUTOSTART="$HOME/.config/autostart/dock-monitors.desktop"
-pkill -u "$USER" -f "$HOME/.local/bin/dock-monitors" 2>/dev/null || true
-if [ "${DOCK_STYLE:-plank}" = plank ] && [ "${DOCK_MONITORS:-all}" = all ]; then
-  echo "==> Installing dock-monitors (a dock on every monitor)"
-  install -m 755 "$KIT_DIR/extras/dock-monitors" "$HOME/.local/bin/dock-monitors"
-  cat > "$DM_AUTOSTART" <<EOF
+# monitor-watch: re-places the docks and top bar and puts windows back when
+# monitors are connected/disconnected while logged in (also runs the extra
+# docks for DOCK_MONITORS=all). Replaces the older dock-monitors script.
+echo "==> Installing monitor-watch (monitor changes: docks, top bar, windows)"
+pkill -u "$USER" -f "^/bin/sh $HOME/.local/bin/dock-monitors" 2>/dev/null || true
+rm -f "$HOME/.local/bin/dock-monitors" "$HOME/.config/autostart/dock-monitors.desktop"
+pkill -u "$USER" -f "^python3 $HOME/.local/bin/monitor-watch" 2>/dev/null || true
+install -m 755 "$KIT_DIR/extras/monitor-watch" "$HOME/.local/bin/monitor-watch"
+cat > "$HOME/.config/autostart/monitor-watch.desktop" <<EOF
 [Desktop Entry]
 Type=Application
-Name=Dock on every monitor
-Comment=One Plank dock per monitor (mint-ui-kit)
-Exec=$HOME/.local/bin/dock-monitors
+Name=Monitor Watch
+Comment=Keeps docks, top bar and windows in place when monitors change (mint-ui-kit)
+Exec=python3 $HOME/.local/bin/monitor-watch
 X-GNOME-Autostart-enabled=true
 EOF
-else
-  rm -f "$DM_AUTOSTART"
-  # close extra docks from DOCK_MONITORS=all
+if [ "${DOCK_MONITORS:-all}" != all ]; then
+  # close extra docks left over from DOCK_MONITORS=all
   pkill -u "$USER" -f '^plank -n kit-' 2>/dev/null || true
 fi
 
@@ -170,9 +172,7 @@ if [ $IN_SESSION -eq 1 ]; then
   pkill -u "$USER" -f "$HOME/.local/bin/desktop-style" 2>/dev/null || true
   "$HOME/.local/bin/desktop-style" --once
   nohup "$HOME/.local/bin/desktop-style" >/dev/null 2>&1 &
-  if [ -f "$DM_AUTOSTART" ] && pgrep -u "$USER" -x plank >/dev/null; then
-    nohup "$HOME/.local/bin/dock-monitors" >/dev/null 2>&1 &
-  fi
+  nohup python3 "$HOME/.local/bin/monitor-watch" >/dev/null 2>&1 &
 fi
 
 echo

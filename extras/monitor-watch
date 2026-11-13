@@ -1,0 +1,489 @@
+#!/usr/bin/env python3
+"""monitor-watch - keep the desktop tidy when monitors come and go
+
+Reacts to every monitor change while you're logged in (KVM switches,
+plugging/unplugging, turning screens off), waits for things to settle, then:
+
+  1. makes sure one connected monitor is primary (the top bar and the main
+     dock live on the primary monitor)
+  2. restarts the Plank docks so each one is placed fresh: the main dock on
+     the primary monitor and, with DOCK_MONITORS=all, one on every other
+     monitor. (Plank keeps stale size/position after layout changes, which
+     leaves an invisible strip that blocks clicks.)
+  3. checks the top bar sits on the primary monitor, and restarts the panel
+     if it doesn't
+  4. puts windows back: when a monitor disappears, the window manager moves
+     its windows to the remaining screens. When that monitor returns, the
+     windows go back where they were.
+  5. fixes click areas: xfwm4 can leave a window's clickable area at its old
+     size after it changes monitors, so the right/bottom part of the window
+     ignores clicks. Affected windows are re-maximized/nudged to rebuild it.
+
+Extra docks share dock1's pinned apps (their launchers folder links to
+dock1's) and copy its look (theme, size, hiding), so pinning on one screen
+pins everywhere and light/dark switching applies to all docks.
+
+Settings: ~/.config/desktop-style.conf (DOCK_STYLE, DOCK_MONITORS), written
+by install-ui.sh. Started at login by ~/.config/autostart/monitor-watch.desktop.
+
+  monitor-watch           run normally
+  monitor-watch --once    place docks/top bar once and exit
+  monitor-watch --debug   log what it does to stderr
+"""
+
+import fcntl
+import os
+import re
+import subprocess
+import sys
+import time
+
+import gi
+
+gi.require_version("Gdk", "3.0")
+gi.require_version("Gtk", "3.0")
+gi.require_version("Wnck", "3.0")
+from gi.repository import Gdk, Gio, GLib, Gtk, Wnck  # noqa: E402
+
+SETTLE_MS = 2500          # wait this long after the last change before acting
+SNAPSHOT_EVERY_S = 2      # how often window positions are remembered
+PLANK_SCHEMA = "net.launchpad.plank.dock.settings"
+PLANK_BASE = "/net/launchpad/plank/docks/"
+PLANK_CFG = os.path.expanduser("~/.config/plank")
+# dock1 settings copied to the extra docks
+SYNC_KEYS = ("theme", "icon-size", "hide-mode", "position", "alignment",
+             "zoom-enabled", "show-dock-item", "pinned-only", "dock-items")
+DEBUG = "--debug" in sys.argv
+
+
+def log(*args):
+    if DEBUG:
+        print(time.strftime("%H:%M:%S"), *args, file=sys.stderr, flush=True)
+
+
+def read_conf():
+    conf = {"DOCK_STYLE": "plank", "DOCK_MONITORS": "all"}
+    path = os.path.expanduser("~/.config/desktop-style.conf")
+    try:
+        with open(path) as f:
+            for line in f:
+                m = re.match(r'^([A-Z_]+)="?([^"]*)"?\s*$', line.strip())
+                if m:
+                    conf[m.group(1)] = m.group(2)
+    except OSError:
+        pass
+    return conf
+
+
+# --- monitors -------------------------------------------------------------
+
+def monitors():
+    """Active monitors as dicts: name, x, y, w, h, primary (from xrandr)."""
+    try:
+        out = subprocess.run(["xrandr", "--listactivemonitors"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    mons = []
+    for line in out.splitlines()[1:]:
+        m = re.match(r"\s*\d+:\s+\+?(\*?)(\S+)\s+(\d+)/\d+x(\d+)/\d+\+(-?\d+)\+(-?\d+)\s+(\S+)", line)
+        if m:
+            mons.append({"primary": m.group(1) == "*", "name": m.group(7),
+                         "w": int(m.group(3)), "h": int(m.group(4)),
+                         "x": int(m.group(5)), "y": int(m.group(6))})
+    return mons
+
+
+def layout_key(mons):
+    return tuple(sorted((m["name"], m["x"], m["y"], m["w"], m["h"]) for m in mons))
+
+
+def contains(a, b):
+    """True if monitor b lies entirely inside monitor a (mirrored screen)."""
+    return (b["x"] >= a["x"] and b["y"] >= a["y"] and
+            b["x"] + b["w"] <= a["x"] + a["w"] and b["y"] + b["h"] <= a["y"] + a["h"])
+
+
+def monitor_at(mons, x, y):
+    for m in mons:
+        if m["x"] <= x < m["x"] + m["w"] and m["y"] <= y < m["y"] + m["h"]:
+            return m["name"]
+    return None
+
+
+def ensure_primary(mons):
+    """If no connected monitor is primary, make the largest one primary."""
+    if not mons or any(m["primary"] for m in mons):
+        return mons
+    best = max(mons, key=lambda m: (m["w"] * m["h"], -m["x"]))
+    log("no primary monitor; making", best["name"], "primary")
+    subprocess.run(["xrandr", "--output", best["name"], "--primary"],
+                   capture_output=True, timeout=10)
+    return monitors()
+
+
+# --- docks (Plank) ----------------------------------------------------------
+
+def plank_settings(dock):
+    return Gio.Settings.new_with_path(PLANK_SCHEMA, PLANK_BASE + dock + "/")
+
+
+def plank_available():
+    src = Gio.SettingsSchemaSource.get_default()
+    return src is not None and src.lookup(PLANK_SCHEMA, True) is not None
+
+
+def running_docks():
+    """{dock name: pid} for the user's Plank processes."""
+    docks = {}
+    try:
+        out = subprocess.run(["pgrep", "-u", str(os.getuid()), "-a", "-x", "plank"],
+                             capture_output=True, text=True).stdout
+    except OSError:
+        return docks
+    for line in out.splitlines():
+        parts = line.split()
+        name = "dock1"
+        if "-n" in parts and parts.index("-n") + 1 < len(parts):
+            name = parts[parts.index("-n") + 1]
+        docks[name] = int(parts[0])
+    return docks
+
+
+def dock_name(monitor):
+    return "kit-" + re.sub(r"[^A-Za-z0-9_-]", "-", monitor)
+
+
+def sync_dock_settings(dock):
+    src, dst = plank_settings("dock1"), plank_settings(dock)
+    for key in SYNC_KEYS:
+        value = src.get_value(key)
+        if not dst.get_value(key).equal(value):
+            dst.set_value(key, value)
+
+
+def prepare_extra_dock(dock, monitor):
+    os.makedirs(os.path.join(PLANK_CFG, dock), exist_ok=True)
+    os.makedirs(os.path.join(PLANK_CFG, "dock1", "launchers"), exist_ok=True)
+    link = os.path.join(PLANK_CFG, dock, "launchers")
+    if not os.path.islink(link):          # share dock1's pinned apps
+        if os.path.isdir(link):
+            for f in os.listdir(link):
+                os.remove(os.path.join(link, f))
+            os.rmdir(link)
+        os.symlink("../dock1/launchers", link)
+    sync_dock_settings(dock)
+    plank_settings(dock).set_string("monitor", monitor)
+
+
+def stop_dock(pid):
+    try:
+        os.kill(pid, 15)
+    except OSError:
+        pass
+
+
+def start_dock(dock):
+    args = ["plank"] if dock == "dock1" else ["plank", "-n", dock]
+    subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True,
+                     close_fds=True, cwd=os.path.expanduser("~"))
+
+
+def wanted_extra_docks(mons, conf):
+    """{dock name: monitor} for every non-primary, non-mirrored monitor."""
+    if conf.get("DOCK_MONITORS", "all") != "all" or not mons:
+        return {}
+    primary = next((m for m in mons if m["primary"]), mons[0])
+    want = {}
+    for i, m in enumerate(mons):
+        if m is primary:
+            continue
+        mirrored = any(o is not m and contains(o, m) and
+                       ((o["w"], o["h"]) != (m["w"], m["h"]) or mons.index(o) < i)
+                       for o in mons)
+        if not mirrored:
+            want[dock_name(m["name"])] = m["name"]
+    return want
+
+
+def place_docks(mons, conf, restart):
+    """Start/stop docks to match the monitors; restart=True re-places all."""
+    if conf.get("DOCK_STYLE", "plank") != "plank" or not plank_available():
+        return
+    plank_settings("dock1").set_string("monitor", "")   # main dock: primary
+    want = wanted_extra_docks(mons, conf)
+    have = running_docks()
+    for dock, pid in have.items():
+        if dock.startswith("kit-") and dock not in want:
+            log("closing dock", dock)
+            stop_dock(pid)
+        elif restart and (dock == "dock1" or dock in want):
+            log("restarting dock", dock)
+            stop_dock(pid)
+    if restart:
+        time.sleep(0.5)
+        have = running_docks()
+    if "dock1" not in have:
+        start_dock("dock1")
+    for dock, monitor in want.items():
+        prepare_extra_dock(dock, monitor)
+        if dock not in have:
+            log("starting dock", dock, "on", monitor)
+            start_dock(dock)
+
+
+# --- top bar (XFCE panel) -----------------------------------------------------
+
+def check_top_bar(mons):
+    """Restart the panel if the top bar isn't across the primary monitor."""
+    primary = next((m for m in mons if m["primary"]), None)
+    if primary is None:
+        return
+    screen = Wnck.Screen.get_default()
+    screen.force_update()
+    for w in screen.get_windows():
+        if w.get_class_group_name() != "Xfce4-panel" or w.get_window_type() != Wnck.WindowType.DOCK:
+            continue
+        x, y, width, height = w.get_geometry()
+        if width < 200 or height > 200:
+            continue                       # not the bar itself
+        if not (x == primary["x"] and y == primary["y"] and width == primary["w"]):
+            log("top bar at", (x, y, width), "but primary is", primary["name"],
+                "- restarting the panel")
+            subprocess.Popen(["xfce4-panel", "-r"], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        return
+
+
+# --- stale click areas ------------------------------------------------------
+# After a window moves between monitors of different sizes, xfwm4 can leave
+# the frame's input shape (the area that accepts clicks) at the old size, so
+# clicks on the right/bottom part of the window fall through. Re-maximizing
+# or nudging the window's size makes xfwm4 rebuild it.
+
+_xlib = None
+
+
+def xlib():
+    global _xlib
+    if _xlib is None:
+        import ctypes
+        import ctypes.util
+        X = ctypes.CDLL(ctypes.util.find_library("X11"))
+        Xe = ctypes.CDLL(ctypes.util.find_library("Xext"))
+
+        class Rect(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_short), ("y", ctypes.c_short),
+                        ("w", ctypes.c_ushort), ("h", ctypes.c_ushort)]
+        X.XOpenDisplay.restype = ctypes.c_void_p
+        X.XQueryTree.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                 ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+                                 ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)),
+                                 ctypes.POINTER(ctypes.c_uint)]
+        X.XFree.argtypes = [ctypes.c_void_p]
+        Xe.XShapeGetRectangles.restype = ctypes.POINTER(Rect)
+        Xe.XShapeGetRectangles.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
+                                           ctypes.POINTER(ctypes.c_int),
+                                           ctypes.POINTER(ctypes.c_int)]
+        _xlib = (ctypes, X, Xe, X.XOpenDisplay(None))
+    return _xlib
+
+
+def input_area_ok(xid, frame_w, frame_h):
+    """False if the window frame's clickable area is smaller than the frame."""
+    try:
+        ctypes, X, Xe, dpy = xlib()
+        if not dpy:
+            return True
+        root, parent = ctypes.c_ulong(), ctypes.c_ulong()
+        kids, n = ctypes.POINTER(ctypes.c_ulong)(), ctypes.c_uint()
+        if not X.XQueryTree(dpy, xid, ctypes.byref(root), ctypes.byref(parent),
+                            ctypes.byref(kids), ctypes.byref(n)):
+            return True
+        if kids:
+            X.XFree(kids)
+        if not parent.value or parent.value == root.value:
+            return True
+        count, order = ctypes.c_int(), ctypes.c_int()
+        rects = Xe.XShapeGetRectangles(dpy, parent.value, 2,      # 2 = ShapeInput
+                                       ctypes.byref(count), ctypes.byref(order))
+        if count.value <= 0:
+            return True
+        right = max(rects[i].x + rects[i].w for i in range(count.value))
+        bottom = max(rects[i].y + rects[i].h for i in range(count.value))
+        X.XFree(rects)
+        return right >= frame_w and bottom >= frame_h
+    except Exception as e:                      # never let this break the watcher
+        log("input check failed:", e)
+        return True
+
+
+def fix_click_areas():
+    for w in normal_windows():
+        if w.is_minimized():
+            continue
+        x, y, width, height = w.get_geometry()
+        if input_area_ok(w.get_xid(), width, height):
+            continue
+        log("fixing click area of", w.get_name())
+        if w.is_maximized():
+            w.unmaximize()
+            GLib.timeout_add(300, lambda w=w: (w.maximize(), False)[1])
+        else:
+            mask = Wnck.WindowMoveResizeMask.WIDTH | Wnck.WindowMoveResizeMask.HEIGHT
+            w.set_geometry(Wnck.WindowGravity.CURRENT, mask, x, y, width - 1, height)
+            GLib.timeout_add(300, lambda w=w, g=(x, y, width, height): (
+                w.set_geometry(Wnck.WindowGravity.CURRENT, mask, *g), False)[1])
+    return False
+
+
+# --- windows --------------------------------------------------------------
+
+def normal_windows():
+    screen = Wnck.Screen.get_default()
+    screen.force_update()
+    return [w for w in screen.get_windows()
+            if w.get_window_type() in (Wnck.WindowType.NORMAL, Wnck.WindowType.DIALOG)
+            and not w.is_skip_tasklist()]
+
+
+def snapshot(mons):
+    """{xid: (monitor, frame x, y, w, h, maximized, monitor rect)}"""
+    snap = {}
+    for w in normal_windows():
+        if w.is_minimized():
+            continue
+        x, y, width, height = w.get_geometry()
+        mon = monitor_at(mons, x + width // 2, y + height // 2) or monitor_at(mons, x, y)
+        rect = next(((m["x"], m["y"], m["w"], m["h"]) for m in mons if m["name"] == mon), None)
+        snap[w.get_xid()] = (mon, x, y, width, height, w.is_maximized(), rect)
+    return snap
+
+
+def restore_window(w, saved, mons):
+    name, x, y, width, height, maximized, rect = saved
+    now = next((m for m in mons if m["name"] == name), None)
+    if now is None or rect is None:
+        return
+    if (now["w"], now["h"]) != rect[2:]:
+        log("not restoring", w.get_name(), "-", name, "came back at another size")
+        return
+    x += now["x"] - rect[0]                 # monitor may sit elsewhere now
+    y += now["y"] - rect[1]
+    if w.is_maximized():
+        w.unmaximize()
+    mask = (Wnck.WindowMoveResizeMask.X | Wnck.WindowMoveResizeMask.Y |
+            Wnck.WindowMoveResizeMask.WIDTH | Wnck.WindowMoveResizeMask.HEIGHT)
+    w.set_geometry(Wnck.WindowGravity.STATIC, mask, x, y, width, height)
+    if maximized:
+        GLib.timeout_add(300, lambda: (w.maximize(), False)[1])
+
+
+class Watcher:
+    def __init__(self):
+        self.conf = read_conf()
+        self.mons = ensure_primary(monitors())
+        self.key = layout_key(self.mons)
+        self.last_snap = {}       # windows in the current layout
+        # windows moved off a monitor that disappeared: xid -> position before
+        self.displaced = {}
+        self.pending = 0
+        place_docks(self.mons, self.conf, restart=False)
+        display = Gdk.Display.get_default()
+        display.connect("monitor-added", self.changed)
+        display.connect("monitor-removed", self.changed)
+        Gdk.Screen.get_default().connect("monitors-changed", self.changed)
+        Gdk.Screen.get_default().connect("size-changed", self.changed)
+        plank_settings("dock1").connect("changed", self.dock1_changed)
+        GLib.timeout_add_seconds(SNAPSHOT_EVERY_S, self.tick)
+        self.tick()
+        fix_click_areas()
+        log("watching; monitors:", [m["name"] for m in self.mons])
+
+    def dock1_changed(self, settings, key):
+        if key in SYNC_KEYS:
+            for dock in running_docks():
+                if dock.startswith("kit-"):
+                    sync_dock_settings(dock)
+
+    def tick(self):
+        if not self.pending:
+            self.last_snap = snapshot(self.mons)
+        return True
+
+    def changed(self, *args):
+        if self.pending:
+            GLib.source_remove(self.pending)
+        self.pending = GLib.timeout_add(SETTLE_MS, self.settle)
+
+    def settle(self):
+        self.pending = 0
+        mons = ensure_primary(monitors())
+        key = layout_key(mons)
+        if key == self.key:
+            return False
+        names = {m["name"] for m in mons}
+        log("monitors changed:", [m["name"] for m in self.mons], "->", sorted(names))
+
+        # windows whose monitor just disappeared will be moved by the WM
+        for xid, saved in self.last_snap.items():
+            if saved[0] and saved[0] not in names and xid not in self.displaced:
+                self.displaced[xid] = saved
+
+        self.conf = read_conf()
+        self.mons, self.key = mons, key
+        place_docks(mons, self.conf, restart=True)
+        GLib.timeout_add(1500, lambda: (check_top_bar(self.mons), False)[1])
+        GLib.timeout_add(1000, self.restore_windows)
+        GLib.timeout_add(3000, fix_click_areas)     # after windows are back
+        return False
+
+    def restore_windows(self):
+        names = {m["name"] for m in self.mons}
+        by_xid = {w.get_xid(): w for w in normal_windows()}
+        for xid, before in list(self.displaced.items()):
+            w = by_xid.get(xid)
+            if w is None:                        # window was closed
+                del self.displaced[xid]
+                continue
+            if before[0] not in names:
+                continue                         # its monitor is still away
+            if tuple(w.get_geometry()) == before[1:5] and w.is_maximized() == before[5]:
+                del self.displaced[xid]          # already back in place
+                continue
+            log("restoring", w.get_name(), "to", before[0], before[1:5])
+            restore_window(w, before, self.mons)
+            del self.displaced[xid]
+        self.last_snap = snapshot(self.mons)
+        return False
+
+
+def main():
+    lock_path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"),
+                             "monitor-watch.%d.lock" % os.getuid())
+    lock = open(lock_path, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return                                  # already running
+    os.set_inheritable(lock.fileno(), False)    # docks must not hold it
+
+    Gtk.init([])
+    if "--once" in sys.argv:
+        conf = read_conf()
+        mons = ensure_primary(monitors())
+        place_docks(mons, conf, restart=True)
+        time.sleep(1.5)
+        check_top_bar(mons)
+        fix_click_areas()
+        time.sleep(0.5)                          # let re-maximizes finish
+        while Gtk.events_pending():
+            Gtk.main_iteration()
+        return
+    Watcher()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

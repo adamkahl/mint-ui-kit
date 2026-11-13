@@ -18,6 +18,9 @@ Guacamole.
   added and removed automatically as you connect or disconnect screens. Pins
   are shared, so pinning on one screen pins everywhere. Every dock shows all
   open apps (Plank can't split them by screen).
+- **Changing monitors while logged in** (KVM switch, plugging in a screen):
+  the docks and top bar are re-placed on the right screens, and windows that
+  were moved off a disconnected monitor go back to it when it returns.
 - **Remote desktop:** the dock never auto-hides over xrdp
   (`DOCK_AUTOHIDE_REMOTE`), since the screen edge is hard to reach there.
 
@@ -30,7 +33,7 @@ Guacamole.
 | `extras/desktop-style` | Applies the themes and dock settings at login and switches light/dark |
 | `extras/panel-layout` | Builds the top bar + dock |
 | `extras/plank-themes/` | The solid light/dark dock themes |
-| `extras/dock-monitors` | Keeps a dock on every monitor as monitors come and go |
+| `extras/monitor-watch` | Handles monitors connecting/disconnecting while logged in: docks, top bar, windows |
 
 ## Set up a machine
 

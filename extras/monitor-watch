@@ -47,6 +47,7 @@ from gi.repository import Gdk, Gio, GLib, Gtk, Wnck  # noqa: E402
 
 SETTLE_MS = 2500          # wait this long after the last change before acting
 SNAPSHOT_EVERY_S = 2      # how often window positions are remembered
+HEALTH_CHECK_EVERY_S = 10 # how often dock/top bar placement is double-checked
 PLANK_SCHEMA = "net.launchpad.plank.dock.settings"
 PLANK_BASE = "/net/launchpad/plank/docks/"
 PLANK_CFG = os.path.expanduser("~/.config/plank")
@@ -78,19 +79,20 @@ def read_conf():
 # --- monitors -------------------------------------------------------------
 
 def monitors():
-    """Active monitors as dicts: name, x, y, w, h, primary (from xrandr)."""
-    try:
-        out = subprocess.run(["xrandr", "--listactivemonitors"],
-                             capture_output=True, text=True, timeout=10).stdout
-    except (OSError, subprocess.TimeoutExpired):
+    """Active monitors as dicts: name, x, y, w, h, primary.
+
+    Read from GDK, which keeps X's monitor list current from RandR events.
+    (Don't use `xrandr` for this: every query makes the NVIDIA driver re-probe
+    all outputs, which itself announces a change - a feedback loop.)"""
+    display = Gdk.Display.get_default()
+    if display is None:
         return []
     mons = []
-    for line in out.splitlines()[1:]:
-        m = re.match(r"\s*\d+:\s+\+?(\*?)(\S+)\s+(\d+)/\d+x(\d+)/\d+\+(-?\d+)\+(-?\d+)\s+(\S+)", line)
-        if m:
-            mons.append({"primary": m.group(1) == "*", "name": m.group(7),
-                         "w": int(m.group(3)), "h": int(m.group(4)),
-                         "x": int(m.group(5)), "y": int(m.group(6))})
+    for i in range(display.get_n_monitors()):
+        m = display.get_monitor(i)
+        g = m.get_geometry()
+        mons.append({"primary": m.is_primary(), "name": m.get_model() or "monitor-%d" % i,
+                     "x": g.x, "y": g.y, "w": g.width, "h": g.height})
     return mons
 
 
@@ -119,7 +121,8 @@ def ensure_primary(mons):
     log("no primary monitor; making", best["name"], "primary")
     subprocess.run(["xrandr", "--output", best["name"], "--primary"],
                    capture_output=True, timeout=10)
-    return monitors()
+    # GDK hears about the new primary a moment later; mark it ourselves
+    return [dict(m, primary=(m is best)) for m in mons]
 
 
 # --- docks (Plank) ----------------------------------------------------------
@@ -231,6 +234,28 @@ def place_docks(mons, conf, restart):
         if dock not in have:
             log("starting dock", dock, "on", monitor)
             start_dock(dock)
+
+
+def docks_misplaced(mons, conf):
+    """True if a dock isn't flush along the bottom of a monitor at full width,
+    or the number of docks doesn't match the monitors (stale Plank layout)."""
+    if conf.get("DOCK_STYLE", "plank") != "plank" or not mons:
+        return False
+    screen = Wnck.Screen.get_default()
+    screen.force_update()
+    docks = [w.get_geometry() for w in screen.get_windows()
+             if w.get_class_group_name() == "Plank"
+             and w.get_window_type() == Wnck.WindowType.DOCK]
+    docks = [g for g in docks if g[2] >= 300]          # skip tooltips/menus
+    expected = 1 + len(wanted_extra_docks(mons, conf))
+    if len(docks) != expected:
+        return len(docks) > 0 or len(running_docks()) > 0
+    for x, y, width, height in docks:
+        if not any(x == m["x"] and width == m["w"] and y + height == m["y"] + m["h"]
+                   for m in mons):
+            log("dock at", (x, y, width, height), "isn't on any monitor's bottom edge")
+            return True
+    return False
 
 
 # --- top bar (XFCE panel) -----------------------------------------------------
@@ -399,7 +424,32 @@ class Watcher:
         GLib.timeout_add_seconds(SNAPSHOT_EVERY_S, self.tick)
         self.tick()
         fix_click_areas()
+        # self-check: fixes anything already wrong at startup, or a change
+        # that slipped past the monitor signals
+        self.repairs = []          # times of recent dock re-placements
+        GLib.timeout_add_seconds(4, self.health_check)
+        GLib.timeout_add_seconds(HEALTH_CHECK_EVERY_S, self.health_check)
         log("watching; monitors:", [m["name"] for m in self.mons])
+
+    def health_check(self):
+        if self.pending:
+            return True
+        mons = monitors()
+        if layout_key(mons) != self.key:          # a change we didn't hear about
+            self.changed()
+            return True
+        if docks_misplaced(mons, self.conf):
+            now = time.time()
+            self.repairs = [t for t in self.repairs if now - t < 300]
+            if len(self.repairs) < 3:
+                log("docks out of place; re-placing them")
+                self.repairs.append(now)
+                place_docks(mons, self.conf, restart=True)
+            elif len(self.repairs) == 3:
+                log("docks still out of place after 3 tries; leaving them for 5 minutes")
+                self.repairs.append(now)
+        check_top_bar(mons)
+        return True
 
     def dock1_changed(self, settings, key):
         if key in SYNC_KEYS:
